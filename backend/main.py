@@ -1,15 +1,22 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pathlib import Path
 import os
+
 from backend.debate_logic import DebateState, DebatePhase
 from backend.llms_logic import generate_ai_speech, generate_judging_feedback
 
 # Load environment variables
 load_dotenv(Path(__file__).resolve().parent / ".env")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+API_KEY = os.getenv("API_KEY")
+
+# --- Security Dependency ---
+def require_api_key(x_api_key: str = Header(...)):
+    if not API_KEY or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 app = FastAPI()
 
@@ -31,7 +38,7 @@ async def root():
 async def ping():
     return {"status": "ok"}
 
-@app.post("/start-debate")
+@app.post("/start-debate", dependencies=[Depends(require_api_key)])
 async def start_debate(payload: dict):
     try:
         resolution = payload["resolution"]
@@ -43,12 +50,16 @@ async def start_debate(payload: dict):
         debate_session["state"] = state
 
         return JSONResponse(content={"status": "initialized", "state": state.get_state()})
-
     except KeyError as e:
         return JSONResponse(status_code=400, content={"error": f"Missing key: {str(e)}"})
 
 @app.websocket("/ws/debate")
 async def debate_socket(websocket: WebSocket):
+    token = websocket.headers.get("x-api-key")
+    if token != API_KEY:
+        await websocket.close(code=4401)  # Unauthorized
+        return
+
     await websocket.accept()
     state: DebateState = debate_session.get("state")
 
@@ -68,7 +79,6 @@ async def debate_socket(websocket: WebSocket):
             data = await websocket.receive_json()
             print("💬 Received:", data)
 
-            # === END PHASE LOGIC (manual advance or judging) ===
             if data["type"] == "end_phase":
                 if state.current_phase == DebatePhase.FINAL_FOCUS_CON:
                     print("🎓 Judging Phase started.")
@@ -87,7 +97,6 @@ async def debate_socket(websocket: WebSocket):
                     })
                     continue
 
-                # Otherwise just advance to next phase
                 state.advance_phase()
                 await websocket.send_json({
                     "event": "phase_updated",
@@ -107,7 +116,6 @@ async def debate_socket(websocket: WebSocket):
                     })
                 continue
 
-            # === SPEECH LOGIC ===
             if data["type"] != "speech":
                 await websocket.send_json({"error": "Unsupported message type"})
                 continue
@@ -120,7 +128,6 @@ async def debate_socket(websocket: WebSocket):
                 await websocket.send_json({"error": f"Unknown speech_type: {user_speech_type}"})
                 continue
 
-            # Log user input
             state.log_speech(
                 speaker=data["speaker"],
                 role=data["role"],
@@ -128,13 +135,11 @@ async def debate_socket(websocket: WebSocket):
                 content=data["content"]
             )
 
-            # === CROSSFIRE LOGIC ===
             if user_speech_type == "crossfire":
                 if state.current_phase != new_phase:
                     state.current_phase = new_phase
                     print(f"📌 Entering phase: {new_phase.name}")
 
-                # Toggle speaker based on who just spoke
                 state.current_speaker = "ai" if data["speaker"] == "user" else "user"
 
                 await websocket.send_json({
@@ -153,10 +158,8 @@ async def debate_socket(websocket: WebSocket):
                         "text": ai_text,
                         "state": state.get_state()
                     })
-
                 continue
 
-            # === NON-CROSSFIRE PHASE LOGIC ===
             state.current_phase = new_phase
             state.advance_phase()
             print(f"✅ Phase advanced → Now in: {state.current_phase.name}")
@@ -182,8 +185,7 @@ async def debate_socket(websocket: WebSocket):
     except WebSocketDisconnect:
         print("🔌 WebSocket disconnected.")
 
-
-@app.get("/transcript")
+@app.get("/transcript", dependencies=[Depends(require_api_key)])
 async def get_transcript():
     state = debate_session.get("state")
     if not state:

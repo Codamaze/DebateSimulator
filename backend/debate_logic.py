@@ -93,3 +93,5 @@ class DebateState:
             "difficulty": self.ai_difficulty,
             "transcript": self.transcript,
         }
+    def get_transcript(self):
+        return self.transcript

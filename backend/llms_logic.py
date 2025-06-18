@@ -11,7 +11,9 @@ load_dotenv(dotenv_path=env_path)
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "deepseek/deepseek-chat:free"
+PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "deepseek/deepseek-chat:free")
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "mistralai/mistral-7b-instruct:free")
+
 
 # --- Prompt Templates ---
 DIFFICULTY_PROMPTS = {
@@ -43,32 +45,33 @@ def build_messages(debate_state, speech_type_override=None):
     is_summary = "summary" in speech_type.lower()
     is_final_focus = "final focus" in speech_type.lower()
 
-    # === SYSTEM PROMPT ===
-    greeting_instruction = (
-        "Start immediately — do NOT include greetings or meta-commentary. Respond in 1–3 concise sentences."
-        if is_crossfire else
-        "Begin with a brief formal greeting such as 'Honorable judges, esteemed opponents...' then deliver your argument."
-    )
+    # === REFACTORED SYSTEM PROMPT ===
+    speech_name = speech_type.title()
+    current_turn = debate_state.turn_number
+    phase_name = debate_state.current_phase.name.replace("_", " ").title()
 
-    # Base prompt
     system_prompt = f"""
-You are a competitive debater in a Public Forum Debate. Follow the format of the round.
+You are a high-performing AI debater participating in a Public Forum (PF) style debate.
 
-Your assigned role: {side}
-Your position: You must strictly **{stance.upper()}** the resolution:
+Role: {side}  
+Stance: You must **strongly {stance.upper()}** the resolution:  
 "{debate_state.resolution}"
 
-You are now delivering your **{speech_type}** speech.
+Current Speech: **{speech_name}** (Turn {current_turn} in {phase_name} phase)
+
+Objective:
+Deliver your speech using formal PF debate tone, persuasive logic, and strategic structure.
+Respond *to the judges*, not your opponent. Maintain clarity, professionalism, and credibility.
 
 Rules:
-- NEVER support the other side — even partially.
-- Do NOT label your speech as 'Pro Rebuttal' or 'Con Constructive'.
-- Do NOT say 'as instructed' or include instructions in your response.
-
-{greeting_instruction}
+- NEVER support or partially validate the opponent’s case.
+- Do NOT say “as an AI” or include meta-commentary.
+- Do NOT use phrases like "as instructed" or reference the task.
+- Keep tone formal, respectful, and competitive.
+- Speak naturally as if addressing a real judging panel.
 """.strip()
 
-    # Add structure hints inside appropriate conditionals
+    # === STRUCTURE HINTS (unchanged) ===
     if is_crossfire:
         system_prompt += """
 
@@ -98,23 +101,20 @@ Structure: [Summarize main arguments → Highlight key impacts → Emphasize why
 """.strip()
 
     elif is_final_focus:
-        system_prompt +="""
+        system_prompt += """
 - Direct all arguments toward the judge.
 - Emphasize key voting issues, not new content.
 - Do NOT refer to your opponent as 'you.'
 - Explain clearly why your side wins the debate.
 Structure: [Voting issues → Extend winning arguments → Call to decision]
 """.strip()
-
-
     else:
-        # Default to Constructive
         system_prompt += "\n" + SPEECH_STRUCTURE_HINTS["Constructive"]
 
     system_prompt += "\n" + difficulty
     messages.append({"role": "system", "content": system_prompt})
 
-    # === CONTEXT STRATEGY ===
+    # === CONTEXT STRATEGY (unchanged) ===
     def summarize(text, max_length=150):
         if len(text) > max_length:
             short = text[:max_length]
@@ -132,21 +132,19 @@ Structure: [Voting issues → Extend winning arguments → Call to decision]
             elif not context and (
                 "constructive" in entry["speech_type"].lower() or
                 "rebuttal" in entry["speech_type"].lower()
-                ):
+            ):
                 if entry["speaker"] == "user":
                     context.insert(0, {
-                    "speaker": "user",
-                    "content": summarize(entry["content"], max_length=100)
+                        "speaker": "user",
+                        "content": summarize(entry["content"], max_length=100)
                     })
                 break
 
-    # Add only the last user and relevant assistant crossfire context
         for entry in context:
             if entry["speech_type"].lower() == "crossfire":
                 role = "assistant" if entry["speaker"] == "ai" else "user"
                 messages.append({"role": role, "content": entry["content"]})
 
-    # Force-inject latest user crossfire question
         for entry in reversed(context):
             if entry["speaker"] == "user" and "crossfire" in entry["speech_type"].lower():
                 messages.append({"role": "user", "content": entry["content"]})
@@ -165,12 +163,12 @@ Structure: [Voting issues → Extend winning arguments → Call to decision]
         messages.extend(context)
 
     else:
-        # Constructive, Summary, Final Focus
         for entry in debate_state.transcript[-6:]:
             role = "assistant" if entry["speaker"] == "ai" else "user"
             messages.append({"role": role, "content": entry["content"]})
 
     return messages
+
 
 # --- Main LLM Call Function ---
 async def generate_ai_speech(debate_state, speech_type):
@@ -182,8 +180,7 @@ async def generate_ai_speech(debate_state, speech_type):
         "Accept": "application/json"
     }
 
-    payload = {
-        "model": MODEL,
+    payload_base = {
         "messages": messages,
         "stream": True,
         "temperature": 0.7,
@@ -191,19 +188,13 @@ async def generate_ai_speech(debate_state, speech_type):
         "top_p": 0.9
     }
 
-    print("Prompt sent to OpenRouter:")
-    print(json.dumps(payload, indent=2))
-
-    ai_response_text = ""
-
-    try:
+    async def call_model(model):
+        payload = dict(payload_base, model=model)
+        ai_response_text = ""
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("POST", OPENROUTER_URL, json=payload, headers=headers) as response:
                 if response.status_code != 200:
-                    error_msg = await response.aread()
-                    print("OpenRouter API Error:", error_msg.decode())
-                    return "LLM error: Unable to generate speech."
-
+                    raise RuntimeError(await response.aread())
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -213,39 +204,33 @@ async def generate_ai_speech(debate_state, speech_type):
                     try:
                         chunk = json.loads(line)
                         delta = chunk["choices"][0]["delta"]
-                        content = delta.get("content", "")
-                        ai_response_text += content
-                    except Exception as e:
-                        print("Failed to parse chunk:", e)
-                        print("Raw:", line)
+                        ai_response_text += delta.get("content", "")
+                    except Exception:
                         continue
+        return ai_response_text.strip()
 
-    except httpx.RequestError as e:
-        print("Network Error:", e)
-        return "Network error calling OpenRouter."
+    try:
+        return await call_model(PRIMARY_MODEL)
+    except Exception as e:
+        print("⚠️ Primary model failed:", e)
+        try:
+            print("🔁 Using fallback model...")
+            return await call_model(FALLBACK_MODEL)
+        except Exception as f:
+            print("❌ Fallback failed:", f)
+            return "AI error: Could not generate response."
 
-    return ai_response_text.strip()
-
-
+   
 async def generate_judging_feedback(debate_state):
     """
     Uses LLM to judge the full debate transcript.
     Returns a JSON-style evaluation: scores, winner, RFD, and feedback.
     """
-
-    side_map = {
-        "pro": "Proposition",
-        "con": "Opposition"
-    }
-
-    pro_label = side_map["pro"]
-    con_label = side_map["con"]
-
-    transcript_lines = []
-    for entry in debate_state.transcript:
-        line = f"{entry['role']} ({entry['speech_type']}): {entry['content']}"
-        transcript_lines.append(line)
-
+    side_map = {"pro": "Proposition", "con": "Opposition"}
+    transcript_lines = [
+        f"{entry['role']} ({entry['speech_type']}): {entry['content']}"
+        for entry in debate_state.transcript
+    ]
     transcript_text = "\n".join(transcript_lines)
 
     messages = [
@@ -272,10 +257,7 @@ Return your response strictly in JSON with this format:
 Only return the JSON — no explanation or commentary outside of it.
 """.strip()
         },
-        {
-            "role": "user",
-            "content": transcript_text
-        }
+        {"role": "user", "content": transcript_text}
     ]
 
     headers = {
@@ -284,21 +266,28 @@ Only return the JSON — no explanation or commentary outside of it.
         "Accept": "application/json"
     }
 
-    payload = {
-        "model": MODEL,
+    payload_base = {
         "messages": messages,
         "stream": False,
         "temperature": 0.3,
     }
 
-    try:
+    async def call_model(model):
+        payload = dict(payload_base, model=model)
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(OPENROUTER_URL, headers=headers, json=payload)
             if response.status_code != 200:
-                return {"error": f"Judging API error: {response.status_code}"}
-            content = response.json()["choices"][0]["message"]["content"]
-            return json.loads(content)
+                raise RuntimeError(f"Model error {response.status_code}")
+            return json.loads(response.json()["choices"][0]["message"]["content"])
 
+    try:
+        return await call_model(PRIMARY_MODEL)
     except Exception as e:
-        print("Judging Error:", e)
-        return {"error": "Failed to generate judging feedback."}
+        print("⚠️ Judging with primary model failed:", e)
+        try:
+            print("🔁 Judging using fallback model...")
+            return await call_model(FALLBACK_MODEL)
+        except Exception as f:
+            print("❌ Judging fallback failed:", f)
+            return {"error": "Failed to generate judging feedback."}
+    
