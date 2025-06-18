@@ -3,6 +3,7 @@ import json
 import httpx
 from pathlib import Path
 from dotenv import load_dotenv
+import json
 
 # Load .env from backend directory explicitly
 env_path = Path(__file__).resolve().parent / ".env"
@@ -89,10 +90,22 @@ Structure: [Summarize opponent → Refute key points → Rebuild own case → Co
 """.strip()
 
     elif is_summary:
-        system_prompt += "\n" + SPEECH_STRUCTURE_HINTS["Summary"]
+        system_prompt += """
+- Address your arguments to the judge, not your opponent.
+- Do NOT use 'you' or speak directly to the other side.
+- Frame why the judge should vote for your side using impact comparison.
+Structure: [Summarize main arguments → Highlight key impacts → Emphasize why you win]
+""".strip()
 
     elif is_final_focus:
-        system_prompt += "\n" + SPEECH_STRUCTURE_HINTS["Final Focus"]
+        system_prompt +="""
+- Direct all arguments toward the judge.
+- Emphasize key voting issues, not new content.
+- Do NOT refer to your opponent as 'you.'
+- Explain clearly why your side wins the debate.
+Structure: [Voting issues → Extend winning arguments → Call to decision]
+""".strip()
+
 
     else:
         # Default to Constructive
@@ -212,3 +225,80 @@ async def generate_ai_speech(debate_state, speech_type):
         return "Network error calling OpenRouter."
 
     return ai_response_text.strip()
+
+
+async def generate_judging_feedback(debate_state):
+    """
+    Uses LLM to judge the full debate transcript.
+    Returns a JSON-style evaluation: scores, winner, RFD, and feedback.
+    """
+
+    side_map = {
+        "pro": "Proposition",
+        "con": "Opposition"
+    }
+
+    pro_label = side_map["pro"]
+    con_label = side_map["con"]
+
+    transcript_lines = []
+    for entry in debate_state.transcript:
+        line = f"{entry['role']} ({entry['speech_type']}): {entry['content']}"
+        transcript_lines.append(line)
+
+    transcript_text = "\n".join(transcript_lines)
+
+    messages = [
+        {
+            "role": "system",
+            "content": f"""
+You are a debate judge for a Public Forum debate.
+The topic is: "{debate_state.resolution}"
+
+Evaluate this round by:
+- Comparing arguments and evidence quality
+- Assessing refutation and clash
+- Identifying persuasive strategies
+
+Return your response strictly in JSON with this format:
+{{
+  "winner": "Proposition" or "Opposition",
+  "score_pro": number (0-100),
+  "score_con": number (0-100),
+  "rfd": "Reason for decision",
+  "feedback_pro": "Constructive feedback for Pro side",
+  "feedback_con": "Constructive feedback for Con side"
+}}
+Only return the JSON — no explanation or commentary outside of it.
+""".strip()
+        },
+        {
+            "role": "user",
+            "content": transcript_text
+        }
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "stream": False,
+        "temperature": 0.3,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+            if response.status_code != 200:
+                return {"error": f"Judging API error: {response.status_code}"}
+            content = response.json()["choices"][0]["message"]["content"]
+            return json.loads(content)
+
+    except Exception as e:
+        print("Judging Error:", e)
+        return {"error": "Failed to generate judging feedback."}
