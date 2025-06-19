@@ -41,6 +41,7 @@ def build_messages(debate_state, speech_type_override=None):
     difficulty = DIFFICULTY_PROMPTS.get(debate_state.ai_difficulty.lower(), DIFFICULTY_PROMPTS["intermediate"])
 
     is_crossfire = "crossfire" in speech_type.lower()
+    is_crossfire_question= "crossfire-question" in speech_type.lower()
     is_rebuttal = "rebuttal" in speech_type.lower()
     is_summary = "summary" in speech_type.lower()
     is_final_focus = "final focus" in speech_type.lower()
@@ -61,6 +62,7 @@ Current Speech: **{speech_name}** (Turn {current_turn} in {phase_name} phase)
 
 Objective:
 Deliver your speech using formal PF debate tone, persuasive logic, and strategic structure.
+Use a coversational,realistic formal persuasive tone . Avoid saying things like 'Introduction' or listing your structure.
 Respond *to the judges*, not your opponent. Maintain clarity, professionalism, and credibility.
 
 Rules:
@@ -69,6 +71,7 @@ Rules:
 - Do NOT use phrases like "as instructed" or reference the task.
 - Keep tone formal, respectful, and competitive.
 - Speak naturally as if addressing a real judging panel.
+- In constructive phase , greet the jugdes and panel accordingly , BUT only at the start.
 """.strip()
 
     # === STRUCTURE HINTS (unchanged) ===
@@ -81,6 +84,18 @@ Rules:
 - Do not include labels or explanations.
 Structure: [Short question or concise direct answer (1–3 sentences)]
 """.strip()
+    
+    elif is_crossfire_question:
+        last_user_question = debate_state.transcript[-1]["content"]
+        last_ai_answer = debate_state.transcript[-2]["content"] if len(debate_state.transcript) > 1 else ""
+        system_prompt += (
+        f"\n-In the crossfire phase of a public forum debate. The user just asked:\n"
+        f"'{last_user_question}'\n\n"
+        f"You answered:\n'{last_ai_answer}'\n\n"
+        f"Now, ask the user a follow-up question about the topic: '{debate_state.resolution}'. "
+        "Keep it sharp and debate-relevant. Do not preface or summarize.Ask in a respectful manner following the crossfire round rule of PF style debate."
+        "Follow a natural realistic tone , don't use phrases like 'Now i'm asking', maintain a polite human tone."
+    )
 
     elif is_rebuttal:
         system_prompt += """
@@ -110,6 +125,20 @@ Structure: [Voting issues → Extend winning arguments → Call to decision]
 """.strip()
     else:
         system_prompt += "\n" + SPEECH_STRUCTURE_HINTS["Constructive"]
+    
+    system_prompt += """
+
+=== Additional PF Debate Rules ===
+- Follow Public Forum time constraints: each speech is brief and structured. Avoid rambling.
+- Rebuttals, Summaries, and Final Focus must NOT introduce new arguments — only respond, weigh, and extend.
+- In Summary and Final Focus:
+  • Prioritize impact weighing (magnitude, probability, timeframe).
+  • Clearly frame "why you win" to persuade the judge.
+  • Speak concisely and persuasively.
+- Avoid technical jargon; be judge-friendly and accessible.
+- Do not say "I believe" — assert with confidence.
+- Maintain a respectful yet competitive tone.
+"""
 
     system_prompt += "\n" + difficulty
     messages.append({"role": "system", "content": system_prompt})
@@ -122,7 +151,7 @@ Structure: [Voting issues → Extend winning arguments → Call to decision]
             return short[:last_space] + "..." if last_space != -1 else short + "..."
         return text
 
-    if is_crossfire:
+    if is_crossfire or is_crossfire_question:
         context = []
         for entry in reversed(debate_state.transcript):
             if "crossfire" in entry["speech_type"].lower():
@@ -141,7 +170,7 @@ Structure: [Voting issues → Extend winning arguments → Call to decision]
                 break
 
         for entry in context:
-            if entry["speech_type"].lower() == "crossfire":
+            if entry["speech_type"].lower() in ["crossfire","crossfire-question"]:
                 role = "assistant" if entry["speaker"] == "ai" else "user"
                 messages.append({"role": role, "content": entry["content"]})
 

@@ -4,20 +4,23 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pathlib import Path
 import os
-
+import json
 from backend.debate_logic import DebateState, DebatePhase
 from backend.llms_logic import generate_ai_speech, generate_judging_feedback
+from local_audio.tts_utils import speak_aloud 
+from local_audio.cleaning_utils import clean_speech
 
-# Load environment variables
+# --- Load secrets
 load_dotenv(Path(__file__).resolve().parent / ".env")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 API_KEY = os.getenv("API_KEY")
 
-# --- Security Dependency ---
+# --- Auth
 def require_api_key(x_api_key: str = Header(...)):
     if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
+# --- App
 app = FastAPI()
 
 app.add_middleware(
@@ -57,7 +60,7 @@ async def start_debate(payload: dict):
 async def debate_socket(websocket: WebSocket):
     token = websocket.headers.get("x-api-key")
     if token != API_KEY:
-        await websocket.close(code=4401)  # Unauthorized
+        await websocket.close(code=4401)
         return
 
     await websocket.accept()
@@ -76,8 +79,16 @@ async def debate_socket(websocket: WebSocket):
 
     try:
         while True:
-            data = await websocket.receive_json()
-            print("💬 Received:", data)
+            try:
+                data = await websocket.receive_json()
+                print("💬 Received:", json.dumps(data, indent=2))
+            except Exception as e:
+                await websocket.send_json({"error": f"Invalid JSON: {str(e)}"})
+                continue
+
+            if "type" not in data:
+                await websocket.send_json({"error": "Missing 'type' field"})
+                continue
 
             if data["type"] == "end_phase":
                 if state.current_phase == DebatePhase.FINAL_FOCUS_CON:
@@ -114,10 +125,19 @@ async def debate_socket(websocket: WebSocket):
                         "text": ai_text,
                         "state": state.get_state()
                     })
+
+                    speak_aloud(clean_speech(ai_text))
+
                 continue
 
             if data["type"] != "speech":
                 await websocket.send_json({"error": "Unsupported message type"})
+                continue
+
+            required_keys = {"role", "speaker", "speech_type", "content"}
+            missing_keys = required_keys - data.keys()
+            if missing_keys:
+                await websocket.send_json({"error": f"Missing keys: {', '.join(missing_keys)}"})
                 continue
 
             user_speech_type = data["speech_type"].lower()
@@ -158,7 +178,11 @@ async def debate_socket(websocket: WebSocket):
                         "text": ai_text,
                         "state": state.get_state()
                     })
+
+                    speak_aloud(clean_speech(ai_text))
+
                 continue
+
 
             state.current_phase = new_phase
             state.advance_phase()
@@ -182,8 +206,11 @@ async def debate_socket(websocket: WebSocket):
                     "state": state.get_state()
                 })
 
+                speak_aloud(clean_speech(ai_text))
+
     except WebSocketDisconnect:
         print("🔌 WebSocket disconnected.")
+
 
 @app.get("/transcript", dependencies=[Depends(require_api_key)])
 async def get_transcript():
@@ -191,7 +218,6 @@ async def get_transcript():
     if not state:
         return JSONResponse(status_code=400, content={"error": "No active debate."})
     return {"transcript": state.get_transcript()}
-
 
 def map_speech_type_to_phase(speech_type: str, role: str, transcript: list):
     speech_type = speech_type.lower()
