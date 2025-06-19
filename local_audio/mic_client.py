@@ -65,8 +65,6 @@ async def transcribe_audio(audio_np):
 # === Send to Debate Backend ===
 async def send_to_backend(transcript: str, role: str, speech_type: str):
     uri = WEBSOCKET_URL
-
-    # Prepare headers for legacy client
     headers = [("x-api-key", API_KEY)]
 
     try:
@@ -79,6 +77,54 @@ async def send_to_backend(transcript: str, role: str, speech_type: str):
                 "content": transcript
             }))
             print("📤 Sent transcript to backend.")
+
+            if speech_type.lower() != "crossfire":
+                # Normal stage: just wait for one AI response
+                while True:
+                    try:
+                        response = await ws.recv()
+                        data = json.loads(response)
+                        if data.get("event") == "ai_speech":
+                            print(f"🤖 AI said ({data['speech_type']}):\n{data['text']}")
+                            break
+                    except Exception as e:
+                        print("❌ Error reading from WebSocket:", e)
+                        break
+
+            else:
+                # Crossfire stage: keep loop open until user says "stop"
+                async def listen_ws():
+                    try:
+                        while True:
+                            response = await ws.recv()
+                            data = json.loads(response)
+                            if data.get("event") == "ai_speech":
+                                print(f"🤖 AI said ({data['speech_type']}):\n{data['text']}")
+                            elif data.get("event") == "phase_updated":
+                                # ✅ Only break if it's NOT a crossfire phase anymore
+                                new_phase = data["state"]["phase"].lower()
+                                if "crossfire" not in new_phase:
+                                    print("✅ Phase ended.")
+                                    break
+                                else:
+                                    # Still in crossfire — ignore this update
+                                    continue
+                            elif data.get("error"):
+                                print(f"❌ Backend error: {data['error']}")
+                                break
+                    except Exception as e:
+                        print("❌ WebSocket receive error:", e)
+
+                async def user_input():
+                    while True:
+                        stop = await asyncio.get_event_loop().run_in_executor(None, input, "Type 'stop' to end crossfire: ")
+                        if stop.strip().lower() == "stop":
+                            await ws.send(json.dumps({"type": "end_phase"}))
+                            print("🛑 Sent end_phase to backend.")
+                            break
+
+                await asyncio.gather(listen_ws(), user_input())
+
     except Exception as e:
         print("❌ WebSocket error:", e)
 

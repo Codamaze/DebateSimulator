@@ -1,5 +1,3 @@
-# local_audio/tts_utils.py
-
 import pyttsx3
 
 def speak_aloud(text: str):
