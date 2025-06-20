@@ -14,7 +14,6 @@ class DebatePhase(Enum):
     JUDGING_PHASE = auto()
     COMPLETED = auto()
 
-
 class DebateState:
     def __init__(self, resolution: str, user_role: str, ai_difficulty: str, mode: str = "user-vs-ai"):
         self.resolution = resolution
@@ -22,18 +21,46 @@ class DebateState:
         self.ai_role = "con" if self.user_role == "pro" else "pro"
         self.ai_difficulty = ai_difficulty.lower()
         self.mode = mode  # "user-vs-ai" or "ai-vs-ai"
-
-        self.current_phase = DebatePhase.PRO_CONSTRUCTIVE
         self.turn_number = 1
-        self.current_speaker = "user" if self.user_role == "pro" else "ai"
         self.transcript = []
+
+        # Role-based phase order
+        self.phase_order = [
+            DebatePhase.PRO_CONSTRUCTIVE,
+            DebatePhase.CON_CONSTRUCTIVE,
+            DebatePhase.CROSSFIRE_1_QA,
+            DebatePhase.PRO_REBUTTAL,
+            DebatePhase.CON_REBUTTAL,
+            DebatePhase.CROSSFIRE_2_QA,
+            DebatePhase.PRO_SUMMARY,
+            DebatePhase.CON_SUMMARY,
+            DebatePhase.FINAL_FOCUS_PRO,
+            DebatePhase.FINAL_FOCUS_CON,
+            DebatePhase.JUDGING_PHASE,
+            DebatePhase.COMPLETED
+        ] if self.user_role == "pro" else [
+            DebatePhase.CON_CONSTRUCTIVE,
+            DebatePhase.PRO_CONSTRUCTIVE,
+            DebatePhase.CROSSFIRE_1_QA,
+            DebatePhase.CON_REBUTTAL,
+            DebatePhase.PRO_REBUTTAL,
+            DebatePhase.CROSSFIRE_2_QA,
+            DebatePhase.CON_SUMMARY,
+            DebatePhase.PRO_SUMMARY,
+            DebatePhase.FINAL_FOCUS_CON,
+            DebatePhase.FINAL_FOCUS_PRO,
+            DebatePhase.JUDGING_PHASE,
+            DebatePhase.COMPLETED
+        ]
+
+        self.current_phase = self.phase_order[0]
+        self.current_speaker = "user" if self.user_role == self.get_role_from_phase(self.current_phase) else "ai"
 
     def advance_phase(self):
         """Advance to the next major debate phase."""
-        phase_order = list(DebatePhase)
-        index = phase_order.index(self.current_phase)
-        if index + 1 < len(phase_order):
-            self.current_phase = phase_order[index + 1]
+        index = self.phase_order.index(self.current_phase)
+        if index + 1 < len(self.phase_order):
+            self.current_phase = self.phase_order[index + 1]
             self.turn_number = 1
             self._set_speaker_by_phase()
         else:
@@ -52,6 +79,13 @@ class DebateState:
             self.current_speaker = "user" if self.current_speaker == "ai" else "ai"
         elif phase == DebatePhase.JUDGING_PHASE:
             self.current_speaker = "ai"
+
+    def get_role_from_phase(self, phase):
+        if "PRO" in phase.name:
+            return "pro"
+        elif "CON" in phase.name:
+            return "con"
+        return None
 
     def is_crossfire_phase(self):
         return "CROSSFIRE" in self.current_phase.name
@@ -93,5 +127,6 @@ class DebateState:
             "difficulty": self.ai_difficulty,
             "transcript": self.transcript,
         }
+
     def get_transcript(self):
         return self.transcript
