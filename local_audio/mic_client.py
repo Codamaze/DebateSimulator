@@ -4,13 +4,13 @@ import tempfile
 import numpy as np
 import asyncio
 import json
-import websockets
 import httpx
 import os
 import sys
 from dotenv import load_dotenv
-from websockets.http import Headers
 from websockets.legacy.client import connect
+import websockets
+import threading
 
 # === Load Environment ===
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
@@ -28,18 +28,27 @@ def record_audio():
     print("🔴 Recording... Press ENTER again to stop.")
 
     recording = []
+    stop_recording = threading.Event()
 
     def callback(indata, frames, time, status):
         if status:
             print(f"⚠️ Status: {status}")
         recording.append(indata.copy())
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16', callback=callback):
-        input()  # Wait for ENTER to stop
-        print("🛑 Stopped recording.")
+    def wait_for_enter():
+        input()  # Waits for user to press ENTER again
+        stop_recording.set()
 
-    audio_np = np.concatenate(recording, axis=0).flatten()
-    return audio_np
+    # Start the thread to watch for ENTER press
+    enter_thread = threading.Thread(target=wait_for_enter)
+    enter_thread.start()
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16', callback=callback):
+        while not stop_recording.is_set():
+            sd.sleep(100)  # Avoids blocking the stream
+
+    print("🛑 Stopped recording.")
+    return np.concatenate(recording, axis=0).flatten()
 
 # === Transcription ===
 async def transcribe_audio(audio_np):
@@ -62,87 +71,128 @@ async def transcribe_audio(audio_np):
                     print("❌ HTTP Error:", e)
                     return None
 
-# === Send to Debate Backend ===
-async def send_to_backend(transcript: str, role: str, speech_type: str):
-    uri = WEBSOCKET_URL
+# === Debate WebSocket Handler ===
+async def send_to_backend(role: str):
     headers = [("x-api-key", API_KEY)]
 
     try:
-        async with connect(uri, extra_headers=headers) as ws:
-            await ws.send(json.dumps({
-                "type": "speech",
-                "role": role.lower(),
-                "speaker": "user",
-                "speech_type": speech_type,
-                "content": transcript
-            }))
-            print("📤 Sent transcript to backend.")
+        async with connect(
+            WEBSOCKET_URL,
+            extra_headers=headers,
+            ping_interval=10,
+            ping_timeout=3600
+        ) as ws:
+            print("✅ Connected to debate backend.")
 
-            if speech_type.lower() != "crossfire":
-                # Normal stage: just wait for one AI response
-                while True:
-                    try:
+            while True:
+                print("\n🎤 Type your speech type (constructive, rebuttal, summary, crossfire, final_focus) or 'stop' to exit:")
+                speech_type = await asyncio.get_event_loop().run_in_executor(None, input)
+                speech_type = speech_type.strip().lower()
+
+                if speech_type == "stop":
+                    print("👋 Exiting.")
+                    break
+                if speech_type.strip().lower() == "end":
+                    await ws.send(json.dumps({"type": "end_phase"}))
+                    print("📤 Sent end_phase command to backend.")
+                    return
+
+
+                # === Handle Crossfire Mode ===
+                if speech_type == "crossfire":
+                    while True:
+                        print("\n🎤 Press ENTER to ask a crossfire question, or type 'stop' to end crossfire:")
+                        user_input = await asyncio.get_event_loop().run_in_executor(None, input)
+
+                        if user_input.strip().lower() == "stop":
+                            await ws.send(json.dumps({"type": "stop_crossfire"}))
+                            print("🛑 Sent stop_crossfire to backend.")
+                            break
+                        elif user_input.strip() != "":
+                            print("⚠️ Invalid input during crossfire. Press ENTER to speak or type 'stop'.")
+                            continue
+
+                        audio_np = record_audio()
+                        transcript = await transcribe_audio(audio_np)
+                        if not transcript:
+                            print("❌ Skipping due to failed transcription.")
+                            continue
+
+                        await ws.send(json.dumps({
+                            "type": "speech",
+                            "role": role.lower(),
+                            "speaker": "user",
+                            "speech_type": "crossfire",
+                            "content": transcript
+                        }))
+                        print("📤 Sent crossfire question to backend.")
+
+                        # Wait for AI response
+                        try:
+                            while True:
+                                response = await ws.recv()
+                                data = json.loads(response)
+
+                                if data.get("event") == "ai_speech":
+                                    print(f"\n🤖 AI said ({data['speech_type']}):\n{data['text']}")
+                                    break
+                                elif data.get("event") == "crossfire_ended":
+                                    print("✅ Crossfire ended by system.")
+                                    break
+                                elif data.get("error"):
+                                    print(f"❌ Backend error: {data['error']}")
+                                    break
+                        except websockets.exceptions.ConnectionClosed:
+                            print("🔌 Connection closed by server.")
+                            return
+                    continue
+
+                # === Normal Speech Types ===
+                audio_np = record_audio()
+                transcript = await transcribe_audio(audio_np)
+
+                if not transcript:
+                    print("❌ Skipping due to failed transcription.")
+                    continue
+
+                await ws.send(json.dumps({
+                    "type": "speech",
+                    "role": role.lower(),
+                    "speaker": "user",
+                    "speech_type": speech_type,
+                    "content": transcript
+                }))
+                print("📤 Sent to backend.")
+
+                try:
+                    while True:
                         response = await ws.recv()
                         data = json.loads(response)
+
                         if data.get("event") == "ai_speech":
-                            print(f"🤖 AI said ({data['speech_type']}):\n{data['text']}")
+                            print(f"\n🤖 AI said ({data['speech_type']}):\n{data['text']}")
                             break
-                    except Exception as e:
-                        print("❌ Error reading from WebSocket:", e)
-                        break
-
-            else:
-                # Crossfire stage: keep loop open until user says "stop"
-                async def listen_ws():
-                    try:
-                        while True:
-                            response = await ws.recv()
-                            data = json.loads(response)
-                            if data.get("event") == "ai_speech":
-                                print(f"🤖 AI said ({data['speech_type']}):\n{data['text']}")
-                            elif data.get("event") == "phase_updated":
-                                # ✅ Only break if it's NOT a crossfire phase anymore
-                                new_phase = data["state"]["phase"].lower()
-                                if "crossfire" not in new_phase:
-                                    print("✅ Phase ended.")
-                                    break
-                                else:
-                                    # Still in crossfire — ignore this update
-                                    continue
-                            elif data.get("error"):
-                                print(f"❌ Backend error: {data['error']}")
-                                break
-                    except Exception as e:
-                        print("❌ WebSocket receive error:", e)
-
-                async def user_input():
-                    while True:
-                        stop = await asyncio.get_event_loop().run_in_executor(None, input, "Type 'stop' to end crossfire: ")
-                        if stop.strip().lower() == "stop":
-                            await ws.send(json.dumps({"type": "end_phase"}))
-                            print("🛑 Sent end_phase to backend.")
+                        elif data.get("event") == "judging_feedback":
+                            print(f"\n🏁 Judging Feedback:\n{data['feedback']}")
                             break
-
-                await asyncio.gather(listen_ws(), user_input())
+                        elif data.get("error"):
+                            print(f"❌ Backend error: {data['error']}")
+                            break
+                except websockets.exceptions.ConnectionClosed:
+                    print("🔌 Connection closed by server.")
+                    return
 
     except Exception as e:
-        print("❌ WebSocket error:", e)
+        print("❌ WebSocket connection error:", e)
 
-
-# === Main CLI Entrypoint ===
+# === Entrypoint ===
 async def main():
-    if len(sys.argv) < 3:
-        print("Usage: python mic_client.py <role> <speech_type>")
+    if len(sys.argv) < 2:
+        print("Usage: python mic_client.py <role>")
+        print("Example: python mic_client.py pro")
         return
-
     role = sys.argv[1]
-    speech_type = sys.argv[2]
-
-    audio_np = record_audio()
-    transcript = await transcribe_audio(audio_np)
-
-    if transcript:
-        await send_to_backend(transcript, role, speech_type)
+    await send_to_backend(role)
 
 if __name__ == "__main__":
     asyncio.run(main())
