@@ -51,25 +51,54 @@ def record_audio():
     return np.concatenate(recording, axis=0).flatten()
 
 # === Transcription ===
+from pathlib import Path
+
 async def transcribe_audio(audio_np):
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
-        write(tmpfile.name, SAMPLE_RATE, audio_np)
-        with open(tmpfile.name, "rb") as f:
-            files = {"file": ("audio.wav", f, "audio/wav")}
-            headers = {"x-api-key": API_KEY}
-            async with httpx.AsyncClient() as client:
-                try:
-                    response = await client.post(TRANSCRIBE_URL, files=files, headers=headers)
-                    if response.status_code == 200:
-                        transcript = response.json()["transcript"]
-                        print("📝 Transcription:", transcript)
-                        return transcript
-                    else:
-                        print("❌ Transcription error:", response.text)
-                        return None
-                except Exception as e:
-                    print("❌ HTTP Error:", e)
-                    return None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
+            write(tmpfile.name, SAMPLE_RATE, audio_np)
+            tmpfile.flush()  # ensure all data is written
+
+            tmp_path = Path(tmpfile.name)
+
+        for attempt in range(2):  # Try twice
+            try:
+                with open(tmp_path, "rb") as f:
+                    files = {"file": ("audio.wav", f, "audio/wav")}
+                    headers = {"x-api-key": API_KEY}
+                    timeout = httpx.Timeout(600.0, connect=30.0)
+
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        response = await client.post(TRANSCRIBE_URL, files=files, headers=headers)
+                        if response.status_code == 200:
+                            transcript = response.json()["transcript"]
+                            print("📝 Transcription:", transcript)
+                            break  # success
+                        else:
+                            print(f"❌ Transcription error {response.status_code}: {response.text}")
+                            transcript = None
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                print(f"⚠️ Attempt {attempt+1} failed: {e}. Retrying...")
+                await asyncio.sleep(1)
+                continue
+            except Exception as e:
+                print(f"❌ Unexpected error: {e}")
+                transcript = None
+                break
+
+        # 🔐 Cleanup (even if it failed)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"⚠️ Failed to delete temp file: {e}")
+
+        return transcript
+
+    except Exception as outer_error:
+        print(f"❌ Outer error in transcription: {outer_error}")
+        return None
+
+
 
 # === Debate WebSocket Handler ===
 async def send_to_backend(role: str):
@@ -79,7 +108,7 @@ async def send_to_backend(role: str):
         async with connect(
             WEBSOCKET_URL,
             extra_headers=headers,
-            ping_interval=10,
+            ping_interval=1,
             ping_timeout=3600
         ) as ws:
             print("✅ Connected to debate backend.")
@@ -165,7 +194,8 @@ async def send_to_backend(role: str):
                 if not transcript:
                     print("❌ Skipping due to failed transcription.")
                     continue
-
+                print("sending to backend")
+                
                 await ws.send(json.dumps({
                     "type": "speech",
                     "role": role.lower(),
