@@ -93,11 +93,22 @@ async def send_to_backend(role: str):
                     print("👋 Exiting.")
                     break
                 if speech_type.strip().lower() == "end":
+                    print("🛎️ Sending end_phase to trigger judging...")
                     await ws.send(json.dumps({"type": "end_phase"}))
-                    print("📤 Sent end_phase command to backend.")
+
+                    while True:
+                        response = await ws.recv()
+                        data = json.loads(response)
+                        if data.get("event") == "judging_feedback":
+                            print(f"\n🏁 Judging Feedback:\n{data['feedback']}")
+                            return
+                        elif data.get("error"):
+                            print(f"❌ Backend error: {data['error']}")
+                            return
+
                     return
 
-
+                                    
                 # === Handle Crossfire Mode ===
                 if speech_type == "crossfire":
                     while True:
