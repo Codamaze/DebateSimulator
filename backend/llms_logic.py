@@ -3,7 +3,6 @@ import json
 import httpx
 from pathlib import Path
 from dotenv import load_dotenv
-import json
 
 # Load .env from backend directory explicitly
 env_path = Path(__file__).resolve().parent / ".env"
@@ -13,7 +12,6 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "deepseek/deepseek-chat:free")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "mistralai/mistral-7b-instruct:free")
-
 
 # --- Prompt Templates ---
 DIFFICULTY_PROMPTS = {
@@ -31,9 +29,10 @@ SPEECH_STRUCTURE_HINTS = {
 }
 
 def build_messages(debate_state, speech_type_override=None):
+    print("[build_messages] Building messages for speech_type:", speech_type_override or debate_state.get_expected_speech_type())
+
     messages = []
 
-    # Use phase-based speech type unless explicitly overridden
     speech_type = speech_type_override or debate_state.get_expected_speech_type()
 
     side = 'PROPOSITION' if debate_state.ai_role == 'pro' else 'OPPOSITION'
@@ -41,12 +40,10 @@ def build_messages(debate_state, speech_type_override=None):
     difficulty = DIFFICULTY_PROMPTS.get(debate_state.ai_difficulty.lower(), DIFFICULTY_PROMPTS["intermediate"])
 
     is_crossfire = "crossfire" in speech_type.lower()
-    is_crossfire_question= "crossfire-question" in speech_type.lower()
     is_rebuttal = "rebuttal" in speech_type.lower()
     is_summary = "summary" in speech_type.lower()
     is_final_focus = "final focus" in speech_type.lower()
 
-    # === REFACTORED SYSTEM PROMPT ===
     speech_name = speech_type.title()
     current_turn = debate_state.turn_number
     phase_name = debate_state.current_phase.name.replace("_", " ").title()
@@ -74,32 +71,19 @@ Rules:
 - In constructive phase , greet the jugdes and panel accordingly , BUT only at the start.
 """.strip()
 
-    # === STRUCTURE HINTS (unchanged) ===
-    if is_crossfire:
-        system_prompt += """
+    # Add structure hints and other details...
 
+    if is_crossfire:
+        system_prompt += """\n
 - ONLY respond to the opponent’s last question or ask one.
 - Do not include content from your constructive.
 - Do not introduce new arguments.
 - Do not include labels or explanations.
 Structure: [Short question or concise direct answer (1–3 sentences)]
 """.strip()
-    
-    elif is_crossfire_question:
-        last_user_question = debate_state.transcript[-1]["content"]
-        last_ai_answer = debate_state.transcript[-2]["content"] if len(debate_state.transcript) > 1 else ""
-        system_prompt += (
-        f"\n-In the crossfire phase of a public forum debate. The user just asked:\n"
-        f"'{last_user_question}'\n\n"
-        f"You answered:\n'{last_ai_answer}'\n\n"
-        f"Now, ask the user a follow-up question about the topic: '{debate_state.resolution}'. "
-        "Keep it sharp and debate-relevant. Do not preface or summarize.Ask in a respectful manner following the crossfire round rule of PF style debate."
-        "Follow a natural realistic tone , don't use phrases like 'Now i'm asking', maintain a polite human tone."
-    )
 
     elif is_rebuttal:
-        system_prompt += """
-
+        system_prompt += """\n
 - Refute opponent’s previous speech directly.
 - Do not repeat your Constructive.
 - Do not add brand new arguments.
@@ -108,7 +92,7 @@ Structure: [Summarize opponent → Refute key points → Rebuild own case → Co
 """.strip()
 
     elif is_summary:
-        system_prompt += """
+        system_prompt += """\n
 - Address your arguments to the judge, not your opponent.
 - Do NOT use 'you' or speak directly to the other side.
 - Frame why the judge should vote for your side using impact comparison.
@@ -116,18 +100,18 @@ Structure: [Summarize main arguments → Highlight key impacts → Emphasize why
 """.strip()
 
     elif is_final_focus:
-        system_prompt += """
+        system_prompt += """\n
 - Direct all arguments toward the judge.
 - Emphasize key voting issues, not new content.
 - Do NOT refer to your opponent as 'you.'
 - Explain clearly why your side wins the debate.
 Structure: [Voting issues → Extend winning arguments → Call to decision]
 """.strip()
+
     else:
         system_prompt += "\n" + SPEECH_STRUCTURE_HINTS["Constructive"]
-    
-    system_prompt += """
 
+    system_prompt += """\n
 === Additional PF Debate Rules ===
 - Follow Public Forum time constraints: each speech is brief and structured. Avoid rambling.
 - Rebuttals, Summaries, and Final Focus must NOT introduce new arguments — only respond, weigh, and extend.
@@ -141,9 +125,11 @@ Structure: [Voting issues → Extend winning arguments → Call to decision]
 """
 
     system_prompt += "\n" + difficulty
+    print("[build_messages] System prompt constructed:")
+    print(system_prompt[:500] + ("..." if len(system_prompt) > 500 else ""))
+
     messages.append({"role": "system", "content": system_prompt})
 
-    # === CONTEXT STRATEGY (unchanged) ===
     def summarize(text, max_length=150):
         if len(text) > max_length:
             short = text[:max_length]
@@ -151,7 +137,7 @@ Structure: [Voting issues → Extend winning arguments → Call to decision]
             return short[:last_space] + "..." if last_space != -1 else short + "..."
         return text
 
-    if is_crossfire or is_crossfire_question:
+    if is_crossfire:
         context = []
         for entry in reversed(debate_state.transcript):
             if "crossfire" in entry["speech_type"].lower():
@@ -169,6 +155,7 @@ Structure: [Voting issues → Extend winning arguments → Call to decision]
                     })
                 break
 
+        print(f"[build_messages] Adding crossfire context with {len(context)} entries")
         for entry in context:
             if entry["speech_type"].lower() in ["crossfire","crossfire-question"]:
                 role = "assistant" if entry["speaker"] == "ai" else "user"
@@ -189,18 +176,21 @@ Structure: [Voting issues → Extend winning arguments → Call to decision]
                 "role": "assistant" if entry["speaker"] == "ai" else "user",
                 "content": content
             })
+        print(f"[build_messages] Adding rebuttal context with {len(context)} entries")
         messages.extend(context)
 
     else:
+        print(f"[build_messages] Adding last 6 transcript entries as context")
         for entry in debate_state.transcript[-6:]:
             role = "assistant" if entry["speaker"] == "ai" else "user"
             messages.append({"role": role, "content": entry["content"]})
 
+    print(f"[build_messages] Total messages built: {len(messages)}")
     return messages
-
 
 # --- Main LLM Call Function ---
 async def generate_ai_speech(debate_state, speech_type):
+    print(f"[generate_ai_speech] Generating speech for type '{speech_type}'")
     messages = build_messages(debate_state, speech_type)
 
     headers = {
@@ -218,49 +208,58 @@ async def generate_ai_speech(debate_state, speech_type):
     }
 
     async def call_model(model):
+        print(f"[call_model] Calling model '{model}' with {len(messages)} messages...")
         payload = dict(payload_base, model=model)
         ai_response_text = ""
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("POST", OPENROUTER_URL, json=payload, headers=headers) as response:
+                print(f"[call_model] Response status: {response.status_code}")
                 if response.status_code != 200:
-                    raise RuntimeError(await response.aread())
+                    err_text = await response.aread()
+                    print(f"[call_model] Error response: {err_text}")
+                    raise RuntimeError(f"API error: {err_text}")
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
                         continue
                     line = line.replace("data: ", "").strip()
                     if line == "[DONE]":
+                        print("[call_model] Stream ended with [DONE]")
                         break
                     try:
                         chunk = json.loads(line)
                         delta = chunk["choices"][0]["delta"]
                         ai_response_text += delta.get("content", "")
-                    except Exception:
+                    except Exception as e:
+                        print(f"[call_model] JSON parse error: {e}")
                         continue
+        print(f"[call_model] AI response length: {len(ai_response_text)} chars")
         return ai_response_text.strip()
 
     try:
-        return await call_model(PRIMARY_MODEL)
+        result = await call_model(PRIMARY_MODEL)
+        print("[generate_ai_speech] Primary model succeeded")
+        return result
     except Exception as e:
         print("⚠️ Primary model failed:", e)
         try:
             print("🔁 Using fallback model...")
-            return await call_model(FALLBACK_MODEL)
+            result = await call_model(FALLBACK_MODEL)
+            print("[generate_ai_speech] Fallback model succeeded")
+            return result
         except Exception as f:
             print("❌ Fallback failed:", f)
             return "AI error: Could not generate response."
 
-   
 async def generate_judging_feedback(debate_state):
-    """
-    Uses LLM to judge the full debate transcript.
-    Returns a JSON-style evaluation: scores, winner, RFD, and feedback.
-    """
+    print("[generate_judging_feedback] Starting judging feedback generation...")
     side_map = {"pro": "Proposition", "con": "Opposition"}
     transcript_lines = [
         f"{entry['role']} ({entry['speech_type']}): {entry['content']}"
         for entry in debate_state.transcript
     ]
     transcript_text = "\n".join(transcript_lines)
+
+    print(f"[generate_judging_feedback] Transcript length: {len(transcript_text)} characters")
 
     messages = [
         {
@@ -274,7 +273,7 @@ Evaluate this round by:
 - Assessing refutation and clash
 - Identifying persuasive strategies
 
-Return your response strictly in JSON with this format:
+Return your response strictly , ONLY in the below defined JSON with this format:
 {{
   "winner": "Proposition" or "Opposition",
   "score_pro": number (0-100),
@@ -302,21 +301,30 @@ Only return the JSON — no explanation or commentary outside of it.
     }
 
     async def call_model(model):
+        print(f"[call_model - judging] Calling model '{model}'...")
         payload = dict(payload_base, model=model)
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+            print(f"[call_model - judging] Response status: {response.status_code}")
             if response.status_code != 200:
+                text = await response.aread()
+                print(f"[call_model - judging] Error response: {text}")
                 raise RuntimeError(f"Model error {response.status_code}")
-            return json.loads(response.json()["choices"][0]["message"]["content"])
+            content = response.json()["choices"][0]["message"]["content"]
+            print(f"[call_model - judging] Received response content (first 300 chars): {content[:300]}...")
+            return json.loads(content)
 
     try:
-        return await call_model(PRIMARY_MODEL)
+        result = await call_model(PRIMARY_MODEL)
+        print("[generate_judging_feedback] Primary model succeeded")
+        return result
     except Exception as e:
         print("⚠️ Judging with primary model failed:", e)
         try:
             print("🔁 Judging using fallback model...")
-            return await call_model(FALLBACK_MODEL)
+            result = await call_model(FALLBACK_MODEL)
+            print("[generate_judging_feedback] Fallback model succeeded")
+            return result
         except Exception as f:
             print("❌ Judging fallback failed:", f)
             return {"error": "Failed to generate judging feedback."}
-    
